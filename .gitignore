@@ -1,0 +1,3 @@
+/build/
+/data/computed_torque/*.csv
+__pycache__/

@@ -1,11 +1,12 @@
+#include "gain_config.h"
+#include "run_log.h"
+
 #include <franka/exception.h>
 #include <franka/model.h>
 #include <franka/robot.h>
 
 #include <algorithm>
 #include <array>
-#include <cerrno>
-#include <charconv>
 #include <cmath>
 #include <csignal>
 #include <cstdint>
@@ -13,18 +14,11 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
-#include <limits>
 #include <locale>
-#include <map>
-#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include <system_error>
 #include <vector>
-
-#include <fcntl.h>
-#include <unistd.h>
 
 namespace {
 
@@ -64,42 +58,11 @@ struct Gains {
 using ActiveGains = std::array<Gains, moving.size()>;
 
 ActiveGains loadGains(const std::filesystem::path& path) {
-  std::ifstream config(path);
-  if (!config) {
-    throw std::runtime_error("Could not open gain config: " + path.string());
-  }
   ActiveGains gains{};
-  std::map<std::string, double*> remaining{
+  readGainConfig(path, {
       {"joint2_kp", &gains[0].kp}, {"joint2_kd", &gains[0].kd},
       {"joint4_kp", &gains[1].kp}, {"joint4_kd", &gains[1].kd},
-  };
-  std::string line;
-  for (std::size_t number = 1; std::getline(config, line); ++number) {
-    const auto comment = line.find('#');
-    std::istringstream entry(line.substr(0, comment));
-    entry.imbue(std::locale::classic());
-    std::string key;
-    if (!(entry >> key)) {
-      continue;
-    }
-
-    const auto setting = remaining.find(key);
-    double value = 0.0;
-    std::string extra;
-    if (setting == remaining.end() || !(entry >> value) || !std::isfinite(value) ||
-        value <= 0.0 || (entry >> extra)) {
-      throw std::runtime_error(path.string() + ":" + std::to_string(number) +
-                               ": expected a unique gain key and a positive finite value");
-    }
-    *setting->second = value;
-    remaining.erase(setting);
-  }
-  if (!config.eof()) {
-    throw std::runtime_error("Could not read gain config: " + path.string());
-  }
-  if (!remaining.empty()) {
-    throw std::runtime_error("Missing " + remaining.begin()->first + " in " + path.string());
-  }
+  });
   return gains;
 }
 
@@ -163,47 +126,6 @@ void writeLog(std::ostream& out, const std::vector<Sample>& samples) {
     const auto& [fx, fy, fz] = s.external_force;
     out << ',' << fx << ',' << fy << ',' << fz << ',' << std::hypot(fx, fy, fz) << '\n';
   }
-}
-
-std::filesystem::path reserveLogPath() {
-  const auto directory = std::filesystem::path(FRANKA_PROJECT_DIR) / "data" / "computed_torque";
-  std::filesystem::create_directories(directory);
-
-  std::uint64_t last_run = 0;
-  for (const auto& entry : std::filesystem::directory_iterator(directory)) {
-    if (entry.path().extension() != ".csv") {
-      continue;
-    }
-    auto stem = entry.path().stem();
-    if (stem.extension() == ".franka") {
-      stem = stem.stem();
-    }
-    const auto name = stem.string();
-    std::uint64_t run = 0;
-    const auto end = name.data() + name.size();
-    const auto parsed = std::from_chars(name.data(), end, run);
-    if (parsed.ec == std::errc{} && parsed.ptr == end) {
-      last_run = std::max(last_run, run);
-    }
-  }
-
-  while (last_run < std::numeric_limits<std::uint64_t>::max()) {
-    std::ostringstream name;
-    name.imbue(std::locale::classic());
-    name << std::setfill('0') << std::setw(3) << ++last_run << ".csv";
-    const auto path = directory / name.str();
-    // Reserve the name without overwriting a run started by another process.
-    const int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0666);
-    if (fd >= 0) {
-      close(fd);
-      return path;
-    }
-    const int error = errno;
-    if (error != EEXIST) {
-      throw std::system_error(error, std::generic_category(), "Could not reserve " + path.string());
-    }
-  }
-  throw std::runtime_error("No run numbers remain");
 }
 
 void checkStart(const Joints& start) {
@@ -343,7 +265,8 @@ int main(int argc, char* argv[]) {
     const auto model = robot.loadModel();
     checkStart(robot.readOnce().q);
 
-    const auto log_path = reserveLogPath();
+    const auto log_path = reserveLogPath(std::filesystem::path(FRANKA_PROJECT_DIR) /
+                                     "data" / "computed_torque");
     const std::string path = log_path.string();
     const auto diagnostic_path = log_path.parent_path() / (log_path.stem().string() + ".franka.csv");
     std::ofstream log(path);

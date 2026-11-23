@@ -24,3 +24,21 @@ target_link_libraries(joint_move PRIVATE Franka::Franka)
 add_executable(computed_torque src/computed_torque.cpp)
 target_link_libraries(computed_torque PRIVATE Franka::Franka)
 target_compile_definitions(computed_torque PRIVATE FRANKA_PROJECT_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+
+find_package(Eigen3 REQUIRED)
+add_executable(cartesian_computed_torque src/cartesian_computed_torque.cpp)
+target_link_libraries(cartesian_computed_torque PRIVATE Franka::Franka Eigen3::Eigen)
+target_compile_definitions(cartesian_computed_torque PRIVATE FRANKA_PROJECT_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+
+add_library(cartesian_force_program STATIC src/cartesian_force_program.cpp)
+target_link_libraries(cartesian_force_program PRIVATE Franka::Franka Eigen3::Eigen)
+target_compile_definitions(cartesian_force_program PRIVATE FRANKA_PROJECT_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+
+add_executable(cartesian_force_control src/cartesian_force_control.cpp)
+target_link_libraries(cartesian_force_control PRIVATE cartesian_force_program)
+
+add_executable(cartesian_hybrid_control src/cartesian_hybrid_control.cpp)
+target_link_libraries(cartesian_hybrid_control PRIVATE cartesian_force_program)
+
+add_executable(cartesian_iac1_control src/cartesian_iac1_control.cpp)
+target_link_libraries(cartesian_iac1_control PRIVATE cartesian_force_program)

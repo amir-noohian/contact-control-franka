@@ -9,10 +9,13 @@ Use the libfranka release compatible with your robot's system software. The
 program was built with libfranka 0.18.2. Enable FCI and use the robot's FCI IP
 address or hostname.
 
+If the workstation needs an additional IPv4 address for the FCI connection,
+run `./scripts/setup_franka_network.sh`.
+
 On this workstation, add the Pinocchio library directory before building and running.
 
 ```bash
-export LD_LIBRARY_PATH="/opt/openrobots/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+source scripts/franka_env.sh
 cmake -S . -B build
 cmake --build build
 
@@ -172,8 +175,8 @@ The first command opens the most recent automatically saved run. Pass a CSV path
 to select an earlier run, and use `--output` to save the figure.
 
 ```bash
-python3 scripts/plot_computed_torque.py
-python3 scripts/plot_computed_torque.py data/computed_torque/002.csv --output run02.png
+python3 plot/plot_computed_torque.py
+python3 plot/plot_computed_torque.py data/computed_torque/002.csv --output run02.png
 ```
 
 The plots compare measured and reference position and velocity for joints 2 and
@@ -181,3 +184,231 @@ The plots compare measured and reference position and velocity for joints 2 and
 torque for the five holding joints.
 
 For logs with force data, the figure includes force components and magnitude.
+
+## Cartesian computed torque
+
+`cartesian_computed_torque` drives the end effector in base-frame x and z
+using joints 2 and 4. The other five joints use PD control to hold their
+initial angles. End-effector y and orientation are unconstrained and can
+change with joint geometry and hold error.
+
+```bash
+source scripts/franka_env.sh
+./build/cartesian_computed_torque 0.01 -0.01
+```
+
+The arguments are relative x and z offsets in meters, with a combined
+magnitude up to 0.05 m. The quintic reference takes 20 seconds each way and
+holds the starting x/z target for another second. Check clearance along the
+move, including any orientation change. The controller runs with libfranka's
+real-time scheduling requirement disabled and stops near an x/z singularity,
+near an active joint limit, or when joint excursion or tracking error exceeds
+its limit.
+
+Use `./build/cartesian_computed_torque 0 0` to hold the starting x/z target
+for six seconds and log drift. For a nonzero x offset and zero z offset,
+the controller holds the starting x/z target for one second before starting
+the x trajectory. Both modes stop if measured z deviates by more than 5 mm.
+
+The x and z tracking gains are configured independently in
+`config/cartesian_computed_torque.conf`. Both axes default to $K_p=100$ s⁻²
+and $K_d=20$ s⁻¹. The controller reads the file at startup.
+
+The controller extracts the active mass block $M_a$ and Coriolis vector
+$c_a$ from the libfranka model. With $J$ the x/z Jacobian for joints 2 and 4,
+it computes $\Lambda = J^{-T} M_a J^{-1}$ and
+$\mu = J^{-T}c_a - \Lambda\dot J_{xz}\dot q$. The velocity and Jacobian
+derivative terms use all seven measured joint velocities. The dynamics
+assume zero acceleration on the held joints. The wrench is
+$F = \Lambda a_{cmd} + \mu$, and the active torque command is $J^T F$.
+The robot handles gravity compensation through its torque interface.
+
+CSV logs in `data/cartesian_computed_torque/` include measured and reference
+x/z motion, Cartesian inertia and bias, requested wrench, joint positions,
+torque commands after magnitude and rate limiting, and estimated external
+force along the three base-frame axes.
+
+The CSV also records modeled gravity torque and the sum of the limited
+command and modeled gravity for each joint. The plotter shows this sum for
+joints 2 and 4 when available. The estimate excludes the robot's internal
+friction compensation.
+
+New Cartesian logs use numbered filenames such as `001.csv`. To plot
+the latest run or save a specific run as an image, set up a Python virtual
+environment with Matplotlib. Run the first and third commands once, and
+activate the environment in each shell where you use the plotters.
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install matplotlib
+
+python3 plot/plot_cartesian_computed_torque.py
+python3 plot/plot_cartesian_computed_torque.py data/cartesian_computed_torque/001.csv --output cartesian_run.png
+```
+
+## Cartesian z force control
+
+`cartesian_force_control` regulates downward force against a horizontal
+surface using joints 2 and 4. Place the surface just below the tool at the
+preset approach pose. The other joints
+hold their starting angles with PD feedback. The controller regulates
+force only, so x is monitored for drift.
+
+```bash
+source scripts/franka_env.sh
+./build/cartesian_force_control 2.0
+```
+
+Enter `h` to return to the seven joint angles captured when the program
+started. This works before `t` and after a force run returns to the prompt.
+Check clearance along the return path.
+
+Press `t` to move to the preset seven-joint configuration. Check clearance
+along the approach before pressing `t`. Once the arm reaches the pose, press
+`c` to start force control immediately, including when the tool is still
+above the surface. The arm must be within 0.02 rad of each target joint
+angle when starting. The controller stops if the estimated upward reaction
+has not reached 0.5 N for 30 ms within 4 s or 10 mm of vertical travel.
+Enter `q` to exit while waiting. Submit each command by pressing Enter.
+
+The positive argument is the desired compression in newtons. The reference
+ramps from the initial estimated compression to the target over two seconds,
+holds for two seconds, then ramps back to the initial reference. Keep the tool
+clear of contact when `t` settles. The controller captures the estimated
+external wrench and all seven external joint torques at that pose and subtracts
+the captured values during the `c` run. Force feedback uses the corrected
+base-frame z component, with upward reaction on the arm positive. The CSV also
+records the captured z-force and joint-torque offsets.
+The controller sends the negative of the feedforward plus PI force through
+the z row of the Jacobian transpose for joints 2 and 4. Franka handles
+gravity and friction compensation.
+
+Set force-only contact parameters in `config/cartesian_contact.conf`.
+This includes the robot address, real-time scheduling policy, preset pose,
+joint move timing, hold gains, torque and torque-rate limits, joint
+excursion limits, and contact and workspace limits. For excursion limits,
+edit `active_excursion_rad` for joints 2 and 4 and `held_excursion_rad`
+for the other joints. The values are relative to the pose at `c`.
+
+Set the force-only gains, run duration, and contact-loss threshold in
+`config/cartesian_force_control.conf`. Settings are read at program startup.
+The controller bounds the force and integral terms, limits joint torque and
+torque rate, and stops on contact loss, excess force, or excessive drift.
+Numbered CSVs under `data/cartesian_force_control/` log the requested target
+(`force_target_N`), ramped reference, measured,
+and commanded force, x/z position, commanded joint torques, and whether
+contact has been confirmed. The integrator starts accumulating after contact
+is confirmed to avoid winding up in free space.
+
+Only the run started with `c` is recorded. The plotter uses the requested
+target from the CSV. For older logs, pass `--target` with the original request
+or omit it to show the recorded ramped reference.
+
+```bash
+source .venv/bin/activate
+python plot/plot_cartesian_force_control.py
+python plot/plot_cartesian_force_control.py data/cartesian_force_control/002.csv --target 2 --output force_run.png
+```
+
+## Hybrid Cartesian x motion and z force
+
+```bash
+source scripts/franka_env.sh
+./build/cartesian_hybrid_control 2.0 0.01
+./build/cartesian_hybrid_control 2.0 0.20
+```
+
+The first command requests 2 N of downward compression and a 1 cm move
+along positive base-frame x. The second requests 20 cm. Set the duration
+for either move with `x_motion_s` in `config/cartesian_hybrid_control.conf`.
+The program checks the peak reference speed against the configured limit.
+The x displacement is signed and limited to
+30 cm in magnitude by default. The `t`, `c`, `h`, and `q` commands use the same
+workflow as Cartesian force control. Keep the tool clear of the surface
+when `t` settles so the estimated external wrench and joint torque offsets
+can be captured in free space.
+
+Entering `c` starts the two-second z-force ramp and the one-way quintic
+x trajectory together. The x move takes 40 seconds with the supplied
+configuration. The controller stops if it reaches the no-contact
+time or travel limit. After the x move, it holds the endpoint for one
+second and then ramps down the force. The x integral is active during the
+final hold, with bounded acceleration and anti-windup.
+
+The active-joint command is $\tau_{2,4}=J_{xz}^T[F_x,F_z]^T$.
+The x wrench is $F_x=\Lambda_{xx}a_x^*+\mu_x$. The z wrench comes entirely
+from force feedforward plus PI with offset-corrected force feedback,
+command saturation, and integral anti-windup.
+Franka handles gravity and friction compensation. The other five
+joints hold their starting angles.
+
+The hybrid controller reads all settings from
+`config/cartesian_hybrid_control.conf`, including its robot address, preset
+pose, hold gains, joint excursion and torque limits, contact settings,
+hybrid gains, and x trajectory timing.
+In the hybrid config, `active_excursion_rad` applies to joint 2 and
+`joint_4_excursion_rad` applies to joint 4.
+Numbered logs in
+`data/cartesian_hybrid_control/` include the requested and corrected
+measured z force, x reference and measured motion, the PI and summed wrench
+commands, and the limited joint torques. The force plotter accepts a hybrid
+CSV path directly.
+
+To plot x tracking, z-force tracking, wrench contributions, and active joint
+torques from the latest hybrid run or save a specific run as an image, use
+
+```bash
+source .venv/bin/activate
+python plot/plot_cartesian_hybrid_control.py
+python plot/plot_cartesian_hybrid_control.py data/cartesian_hybrid_control/002.csv --output hybrid_run.png
+```
+
+## IAC1 adaptive effective normal
+
+```bash
+source scripts/franka_env.sh
+./build/cartesian_iac1_control 2.0
+```
+
+Use `t` to move to the preset pose and tare the wrench with the tool clear
+of the surface. Enter `c` to ramp a contact-seeking force along the nominal
+normal within the configured travel and time bounds. Once contact is confirmed,
+IAC1 runs for `run_duration_s` with constant desired compression. The other
+five joints hold their starting angles. Enter `h` at the prompt to return
+to the startup pose.
+
+Set all parameters in `config/cartesian_iac1_control.conf`. The target is a
+fixed Cartesian point. The default is the first confirmed contact point.
+Use `target_x_offset_m` and `target_z_offset_m` to shift that point along the
+surface. The normal points into free space and is parameterized as
+$[-\sin\theta,\cos\theta]^T$ in base-frame x/z. Use a low-friction surface
+because the offset-corrected x/z force magnitude is used as the scalar
+contact-force estimate and includes any tangential force.
+
+The wrench uses full reduced Cartesian inverse dynamics and the constant
+desired force along the effective normal. The estimator integrates the
+IAC1 angle state using the actual sample period and a centered directional
+difference of the libfranka model for $\dot\Lambda$. Angle integration is
+paused when a user torque limit intervenes. Franka supplies gravity and
+friction compensation. The configured angle bound is a runtime stop
+threshold. A convergence sector for the FR3 has yet to be verified.
+
+Numbered CSVs in `data/cartesian_iac1_control/` include measured and desired
+x/z, the scalar contact-force estimate, the adaptive state and effective
+angle, the wrench and the limited joint torques.
+
+Plot the latest IAC1 run or export a specific run as an image.
+
+```bash
+source .venv/bin/activate
+python plot/plot_cartesian_iac1_control.py
+python plot/plot_cartesian_iac1_control.py data/cartesian_iac1_control/001.csv --output iac1_run.png
+```
+
+For a flat surface, the configured `initial_effective_angle_rad` starts
+adaptation with a +10° error. To plot the signed effective-normal error
+after contact, pass `--surface-angle-deg 0` for a flat surface or enter the
+known signed surface tilt from +x toward +z. This angle is used only for the
+plot. The controller reads the initial effective angle from its config at
+startup.

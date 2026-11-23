@@ -1,3 +1,8 @@
 /build/
+/.venv/
 /data/computed_torque/*.csv
 __pycache__/
+/data/cartesian_computed_torque/*.csv
+/data/cartesian_force_control/*.csv
+/data/cartesian_hybrid_control/*.csv
+/data/cartesian_iac1_control/*.csv

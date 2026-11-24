@@ -17,6 +17,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <set>
 #include <stdexcept>
@@ -183,19 +184,23 @@ struct HybridMotion {
 };
 
 struct Iac1Settings {
-  planar_dynamics::Vector target_offset = planar_dynamics::Vector::Zero();
+  double target_x_offset{};
   double nominal_angle{}, initial_angle{}, max_angle_offset{}, gamma{};
   double kp{}, kv{}, max_acceleration{}, difference_step{}, min_singular_value{};
   double max_x_speed{}, max_target_offset{}, max_task_wrench{};
   double trajectory_seconds{};
+  double estimation_seconds{}, jacobian_filter_time{}, tangent_kp{}, tangent_kv{};
+  double tangent_ki{}, tangent_integral_limit{};
+  double estimation_timeout{}, convergence_window{}, convergence_angle_range{};
+  double tangent_travel_margin{};
 };
 
 struct Iac1Sample {
-  planar_dynamics::Vector target = planar_dynamics::Vector::Zero();
-  planar_dynamics::Vector target_velocity = planar_dynamics::Vector::Zero();
-  planar_dynamics::Vector target_acceleration = planar_dynamics::Vector::Zero();
+  double target_x{}, target_z{}, target_dx{}, target_ddx{};
   double normal_force{}, estimate{}, effective_angle{}, estimator_rate{};
   double commanded_compression{};
+  bool normal_frozen{};
+  double stable_seconds{};
 };
 
 struct MotionReference {
@@ -212,6 +217,17 @@ MotionReference motionReference(double start_x, double offset, double time, doub
       offset * 60.0 * s * (1.0 - s) * (1.0 - 2.0 * s) /
           (motion_seconds * motion_seconds),
   };
+}
+
+double motionIntegral(double current, double increment, double pd,
+                      double integral_limit, double acceleration_limit) {
+  const double trial = std::clamp(current + increment, -integral_limit, integral_limit);
+  const double requested = pd + trial;
+  if ((requested > acceleration_limit && trial > current) ||
+      (requested < -acceleration_limit && trial < current)) {
+    return current;
+  }
+  return trial;
 }
 
 struct ExternalEstimate {
@@ -300,8 +316,15 @@ const char* run(franka::Robot& robot, const franka::Model& model, const Gains& g
   const Vector nominal_normal = adaptive ? iac1::normal(adaptive->nominal_angle) : Vector::Zero();
   double iac_start = -1.0;
   Iac1Sample iac;
-  Vector contact_position = Vector::Zero();
-  const bool adaptive_tracking = adaptive && adaptive->trajectory_seconds > 0.0;
+  double contact_x = 0.0;
+  const Vector iac_offset(adaptive ? adaptive->target_x_offset : 0.0, 0.0);
+  const bool sequential = adaptive && adaptive->estimation_seconds > 0.0;
+  const bool adaptive_tracking = adaptive && adaptive->trajectory_seconds > 0.0 && !sequential;
+  double hybrid_start = -1.0;
+  Vector hybrid_origin = Vector::Zero();
+  Vector frozen_normal = Vector::Zero();
+  Vector frozen_tangent = Vector::Zero();
+  iac1::AngleStability stability;
   const char* reason = nullptr;
 
   robot.control([&](const franka::RobotState& state, franka::Duration period) -> franka::Torques {
@@ -320,14 +343,36 @@ const char* run(franka::Robot& robot, const franka::Model& model, const Gains& g
 
     const auto external = zeroedEstimate(externalEstimate(state), baseline);
     const Vector measured_planar(external.wrench[0], external.wrench[2]);
-    const double measured = adaptive ? measured_planar.norm() : external.wrench[2];
-    const double contact_signal = adaptive ? nominal_normal.dot(measured_planar) : measured;
-    if (!external.isFinite() || !std::isfinite(measured) || std::abs(measured) > settings.max_measured) {
+    const double force_magnitude = adaptive ? measured_planar.norm() : std::abs(external.wrench[2]);
+    if (!external.isFinite() || !std::isfinite(force_magnitude) ||
+        force_magnitude > settings.max_measured) {
       return finish("Estimated contact force is outside the operating range");
     }
     const double x = state.O_T_EE[12];
     const double z = state.O_T_EE[14];
     const double dt = period.toSec();
+    if (!samples.empty()) {
+      elapsed += dt;
+    }
+    if (sequential && hybrid_start < 0.0 && iac_start >= 0.0) {
+      const double estimation_elapsed = elapsed - iac_start;
+      if (estimation_elapsed >= adaptive->estimation_seconds &&
+          iac.stable_seconds >= adaptive->convergence_window) {
+        hybrid_start = elapsed;
+        hybrid_origin = Vector(x, z);
+        frozen_normal = iac1::normal(iac.effective_angle);
+        frozen_tangent = iac1::tangent(iac.effective_angle);
+        // Match the IAC1 compression at the switch where the integral limit permits.
+        integral_force = std::clamp(-gains.kp * (target - frozen_normal.dot(measured_planar)),
+                                    -settings.integral_force_limit, settings.integral_force_limit);
+      } else if (estimation_elapsed >= adaptive->estimation_timeout) {
+        return finish("IAC1 normal did not converge before the estimation timeout");
+      }
+    }
+    const bool normal_frozen = hybrid_start >= 0.0;
+    const double measured = normal_frozen ? frozen_normal.dot(measured_planar)
+        : adaptive ? force_magnitude : external.wrench[2];
+    const double contact_signal = adaptive ? nominal_normal.dot(measured_planar) : measured;
     if (samples.empty()) {
       if (!atContactPose(state.q, settings)) {
         return finish("Arm is outside the starting pose tolerance");
@@ -336,14 +381,23 @@ const char* run(franka::Robot& robot, const franka::Model& model, const Gains& g
       start_x = x;
       start_z = z;
       preload = std::clamp(contact_signal, 0.0, settings.max_force_command);
-    } else {
-      elapsed += dt;
     }
 
-    const bool outside_workspace = hybrid
+    const Vector hybrid_displacement = Vector(x, z) - hybrid_origin;
+    const double tangential_travel = frozen_tangent.dot(hybrid_displacement);
+    const bool iac1_in_contact = adaptive && !sequential && in_contact;
+    const bool outside_workspace = normal_frozen
+        ? std::abs(frozen_normal.dot(hybrid_displacement)) > settings.max_tool_travel ||
+              tangential_travel < std::min(0.0, iac_offset.x()) - adaptive->tangent_travel_margin ||
+              tangential_travel > std::max(0.0, iac_offset.x()) + adaptive->tangent_travel_margin
+        : hybrid
         ? std::abs(z - start_z) > settings.max_tool_travel ||
               x < start_x + std::min(0.0, hybrid->offset) - hybrid->max_error ||
               x > start_x + std::max(0.0, hybrid->offset) + hybrid->max_error
+        : iac1_in_contact
+        ? std::abs(z - start_z) > settings.max_tool_travel ||
+              x < contact_x + std::min(0.0, iac_offset.x()) - settings.max_tool_travel ||
+              x > contact_x + std::max(0.0, iac_offset.x()) + settings.max_tool_travel
         : std::hypot(x - start_x, z - start_z) > settings.max_tool_travel;
     if (!std::isfinite(x) || !std::isfinite(z) || outside_workspace ||
         !withinJointLimits(state.q, settings)) {
@@ -372,10 +426,9 @@ const char* run(franka::Robot& robot, const franka::Model& model, const Gains& g
         ? std::max(0.0, elapsed - hybrid->motion_seconds - hybrid->hold_seconds)
         : 0.0;
     if (in_contact && measured < settings.contact_loss) {
-      return finish(hybrid && unload_time > 0.0 ? nullptr : "Contact lost during force control");
+      return finish(unload_time > 0.0 ? nullptr : "Contact lost during force control");
     }
-    const double reference = adaptive && in_contact
-        ? target
+    const double reference = adaptive && in_contact ? target
         : hybrid && unload_time > 0.0
         ? rampForce(unload_time, target, preload, settings.ramp_seconds)
         : rampForce(hybrid || adaptive ? elapsed : std::min(elapsed, settings.duration - elapsed), preload,
@@ -425,12 +478,8 @@ const char* run(franka::Robot& robot, const franka::Model& model, const Gains& g
       }
       const double pd = desired_x.ddx + hybrid->kp * x_error + hybrid->kd * (desired_x.dx - dx);
       if (elapsed >= hybrid->motion_seconds) {
-        const double trial = std::clamp(x_integral + hybrid->ki * dt * x_error,
-                                        -hybrid->max_integral, hybrid->max_integral);
-        if (!((pd + trial > hybrid->max_acceleration && trial > x_integral) ||
-              (pd + trial < -hybrid->max_acceleration && trial < x_integral))) {
-          next_x_integral = trial;
-        }
+        next_x_integral = motionIntegral(x_integral, hybrid->ki * dt * x_error, pd,
+                                         hybrid->max_integral, hybrid->max_acceleration);
       }
       x_acceleration = std::clamp(pd + next_x_integral, -hybrid->max_acceleration,
                                  hybrid->max_acceleration);
@@ -449,17 +498,49 @@ const char* run(franka::Robot& robot, const franka::Model& model, const Gains& g
         return finish("IAC1 x/z Jacobian is too close to singular");
       }
       const Eigen::Map<const Eigen::Matrix<double, 7, 1>> dq(state.dq.data());
+      if (sequential) {
+        if (!samples.empty() && dt > 0.0) {
+          updateJacobianDerivative(derivative, planar, previous, dt,
+                                   adaptive->jacobian_filter_time);
+        }
+        previous = planar;
+      }
       const double measured_dx = (planar * dq).x();
       if (!std::isfinite(measured_dx) || std::abs(measured_dx) > adaptive->max_x_speed) {
         return finish("IAC1 x speed limit exceeded");
       }
       iac.normal_force = measured;
-      iac.commanded_compression = adaptive_tracking && in_contact
+      iac.normal_frozen = normal_frozen;
+      iac.commanded_compression = (adaptive_tracking || normal_frozen) && in_contact
           ? std::clamp(raw_force, 0.0, settings.max_force_command)
           : reference;
-      const Vector position(x, z);
       Vector used_normal = nominal_normal;
-      if (in_contact) {
+      if (normal_frozen) {
+        used_normal = frozen_normal;
+        iac.estimator_rate = 0.0;
+        const auto desired = iac1::trajectory(hybrid_origin,
+                                              iac_offset.x() * frozen_tangent,
+                                              elapsed - hybrid_start, adaptive->trajectory_seconds);
+        iac.target_x = desired.position.x();
+        iac.target_z = desired.position.y();
+        const Vector position_error = desired.position - Vector(x, z);
+        const Vector velocity_error = desired.velocity - planar * dq;
+        const double pd = frozen_tangent.dot(
+            desired.acceleration + adaptive->tangent_kp * position_error +
+            adaptive->tangent_kv * velocity_error);
+        if (elapsed - hybrid_start >= adaptive->trajectory_seconds) {
+          next_x_integral = motionIntegral(
+              x_integral, adaptive->tangent_ki * dt * frozen_tangent.dot(position_error), pd,
+              adaptive->tangent_integral_limit, adaptive->max_acceleration);
+        }
+        const double tangent_acceleration = pd + next_x_integral;
+        if (!std::isfinite(tangent_acceleration) ||
+            std::abs(tangent_acceleration) > adaptive->max_acceleration) {
+          return finish("Hybrid tangential acceleration exceeded its configured bound");
+        }
+        const auto dynamics = cartesianDynamics(model, state, task_jacobian, derivative * dq);
+        wrench = iac1::tangentMotionWrench(dynamics, frozen_tangent, tangent_acceleration);
+      } else if (in_contact) {
         const Vector active_velocity(state.dq[joint2], state.dq[joint4]);
         const Vector velocity = task_jacobian * active_velocity;
         iac1::ModelRates rates;
@@ -477,16 +558,17 @@ const char* run(franka::Robot& robot, const franka::Model& model, const Gains& g
             adaptive->gamma, nominal_tangent, dynamics.inertia, velocity);
         if (iac_start < 0.0) {
           iac_start = elapsed;
-          contact_position = position;
-          iac.target = contact_position + adaptive->target_offset;
+          contact_x = x;
+          iac.target_x = contact_x + (sequential ? 0.0 : iac_offset.x());
+          iac.target_z = z;
           iac.estimate = adaptive->initial_angle + correction;
         }
         if (adaptive_tracking) {
-          const auto desired = iac1::trajectory(contact_position, adaptive->target_offset,
+          const auto desired = iac1::trajectory(Vector(contact_x, 0.0), iac_offset,
                                                 elapsed - iac_start, adaptive->trajectory_seconds);
-          iac.target = desired.position;
-          iac.target_velocity = desired.velocity;
-          iac.target_acceleration = desired.acceleration;
+          iac.target_x = desired.position.x();
+          iac.target_dx = desired.velocity.x();
+          iac.target_ddx = desired.acceleration.x();
         }
         iac.effective_angle = iac.estimate - correction;
         if (!std::isfinite(iac.effective_angle) ||
@@ -494,21 +576,31 @@ const char* run(franka::Robot& robot, const franka::Model& model, const Gains& g
           return finish("IAC1 effective angle exceeded its configured bound");
         }
         used_normal = iac1::normal(iac.effective_angle);
-        const Vector acceleration = iac.target_acceleration + adaptive->kp * (iac.target - position) +
-                                    adaptive->kv * (iac.target_velocity - velocity);
+        const Vector acceleration(
+            iac.target_ddx + adaptive->kp * (iac.target_x - x) +
+                adaptive->kv * (iac.target_dx - velocity.x()),
+            adaptive_tracking ? 0.0 : adaptive->kp * (iac.target_z - z) - adaptive->kv * velocity.y());
         if (!acceleration.allFinite() || acceleration.norm() > adaptive->max_acceleration) {
           return finish("IAC1 motion acceleration exceeded its configured bound");
         }
-        const Vector motion_wrench = dynamics.inertia * acceleration;
-        iac.estimator_rate = iac1::estimatorRate(adaptive->gamma, nominal_tangent, motion_wrench,
+        Vector estimator_motion = dynamics.inertia * acceleration;
+        if (adaptive_tracking) {
+          wrench = iac1::xMotionWrench(dynamics, acceleration.x());
+          // Account for the omitted z motion wrench in the tracking variant.
+          estimator_motion = wrench - dynamics.bias;
+        } else {
+          wrench = dynamics.bias + estimator_motion;
+        }
+        iac.estimator_rate = iac1::estimatorRate(adaptive->gamma, nominal_tangent,
+                                                estimator_motion,
                                                 rates.inertia_rate, velocity, used_normal,
                                                 measured, iac.commanded_compression);
-        wrench = dynamics.bias + motion_wrench;
         if (!std::isfinite(iac.estimator_rate)) {
           return finish("IAC1 estimator rate is invalid");
         }
       } else {
-        iac.target = Vector(start_x, start_z);
+        iac.target_x = start_x;
+        iac.target_z = start_z;
         iac.effective_angle = adaptive->nominal_angle;
         iac.estimate = adaptive->initial_angle;
       }
@@ -549,6 +641,14 @@ const char* run(franka::Robot& robot, const franka::Model& model, const Gains& g
       active_limited |= active && command[j] != raw;
     }
 
+    if (sequential && in_contact && !normal_frozen) {
+      if (active_limited) {
+        stability = {};
+      } else {
+        stability.observe(iac.effective_angle, elapsed, adaptive->convergence_angle_range);
+      }
+      iac.stable_seconds = stability.stableSeconds(elapsed);
+    }
     samples.push_back(
         {elapsed, x, z, reference, external, integral_force, command_z, command, in_contact,
          desired_x, dx, x_acceleration, wrench.x(), wrench.y(), state.q, iac});
@@ -558,10 +658,10 @@ const char* run(franka::Robot& robot, const franka::Model& model, const Gains& g
     const bool drives_out_of_force_saturation =
         (raw_force >= settings.max_force_command && error < 0.0) ||
         (raw_force <= 0.0 && error > 0.0);
-    if (adaptive && in_contact && !active_limited) {
+    if (adaptive && in_contact && !normal_frozen && !active_limited) {
       iac.estimate += dt * iac.estimator_rate;
     }
-    if ((!adaptive || adaptive_tracking) && in_contact && !active_limited &&
+    if ((!adaptive || adaptive_tracking || normal_frozen) && in_contact && !active_limited &&
         ((raw_force > 0.0 && raw_force < settings.max_force_command) ||
          drives_out_of_force_saturation)) {
       integral_force = std::clamp(integral_force + (gains.ki * dt) * error,
@@ -570,7 +670,8 @@ const char* run(franka::Robot& robot, const franka::Model& model, const Gains& g
 
     // Franka supplies gravity and friction compensation.
     const franka::Torques torques(command);
-    const bool complete = adaptive
+    const bool complete = sequential ? normal_frozen && elapsed - hybrid_start >= settings.duration
+        : adaptive
         ? in_contact && elapsed - iac_start >= settings.duration
         : (hybrid ? unload_time >= settings.ramp_seconds : elapsed >= settings.duration);
     return complete ? franka::MotionFinished(torques) : torques;
@@ -582,13 +683,15 @@ void writeLog(std::ostream& log, const std::vector<Sample>& samples, double requ
               const ExternalEstimate& baseline, CartesianForceMode mode) {
   const bool hybrid = mode == CartesianForceMode::hybrid;
   const bool adaptive_tracking = mode == CartesianForceMode::iac1_tracking;
-  const bool adaptive = mode == CartesianForceMode::iac1 || adaptive_tracking;
+  const bool sequential = mode == CartesianForceMode::iac1_hybrid;
+  const bool adaptive = mode == CartesianForceMode::iac1 || adaptive_tracking || sequential;
   log << std::setprecision(17)
       << "elapsed_s,x_m,z_m,force_ref_N,external_fz_N,integral_force_N,command_fz_N";
   for (int j = 1; j <= 7; ++j) {
     log << ",tau_command_Nm_" << j;
   }
-  log << ",contact_confirmed,force_target_N,external_fz_baseline_N,"
+  log << ",contact_confirmed,force_target_N,"
+         "external_fx_baseline_N,external_fy_baseline_N,external_fz_baseline_N,"
          "external_fx_N,external_fy_N,external_mx_Nm,external_my_Nm,external_mz_Nm";
   for (int j = 1; j <= 7; ++j) {
     log << ",tau_external_Nm_" << j << ",tau_external_baseline_Nm_" << j;
@@ -604,6 +707,9 @@ void writeLog(std::ostream& log, const std::vector<Sample>& samples, double requ
   if (adaptive_tracking) {
     log << ",dx_ref_m_s,dz_ref_m_s,ddx_ref_m_s2,ddz_ref_m_s2,normal_command_N";
   }
+  if (sequential) {
+    log << ",normal_command_N,normal_frozen,normal_stable_s";
+  }
   if (hybrid || adaptive) {
     for (int joint = 1; joint <= 7; ++joint) {
       log << ",q_rad_" << joint;
@@ -617,7 +723,8 @@ void writeLog(std::ostream& log, const std::vector<Sample>& samples, double requ
     for (double torque : s.command) {
       log << ',' << torque;
     }
-    log << ',' << (s.in_contact ? 1 : 0) << ',' << requested_force << ',' << baseline.wrench[2]
+    log << ',' << (s.in_contact ? 1 : 0) << ',' << requested_force
+        << ',' << baseline.wrench[0] << ',' << baseline.wrench[1] << ',' << baseline.wrench[2]
         << ',' << fx << ',' << fy << ',' << mx << ',' << my << ',' << mz;
     for (std::size_t j = 0; j < s.external.joint_torque.size(); ++j) {
       log << ',' << s.external.joint_torque[j] << ',' << baseline.joint_torque[j];
@@ -629,15 +736,23 @@ void writeLog(std::ostream& log, const std::vector<Sample>& samples, double requ
     }
     if (adaptive) {
       const auto& iac = s.adaptive;
-      log << ',' << iac.target.x() << ',' << iac.target.y() << ',' << iac.normal_force
+      const double target_z = adaptive_tracking ? std::numeric_limits<double>::quiet_NaN()
+                                                : iac.target_z;
+      log << ',' << iac.target_x << ',' << target_z
+          << ',' << iac.normal_force
           << ',' << iac.estimate << ',' << iac.effective_angle << ',' << iac.estimator_rate
           << ',' << s.command_x << ',' << s.total_command_z;
     }
     if (adaptive_tracking) {
       const auto& iac = s.adaptive;
-      log << ',' << iac.target_velocity.x() << ',' << iac.target_velocity.y()
-          << ',' << iac.target_acceleration.x() << ',' << iac.target_acceleration.y()
+      const double unconstrained = std::numeric_limits<double>::quiet_NaN();
+      log << ',' << iac.target_dx << ',' << unconstrained
+          << ',' << iac.target_ddx << ',' << unconstrained
           << ',' << iac.commanded_compression;
+    }
+    if (sequential) {
+      log << ',' << s.adaptive.commanded_compression << ',' << (s.adaptive.normal_frozen ? 1 : 0)
+          << ',' << s.adaptive.stable_seconds;
     }
     if (hybrid || adaptive) {
       for (double angle : s.q) {
@@ -650,19 +765,26 @@ void writeLog(std::ostream& log, const std::vector<Sample>& samples, double requ
 
 }  // namespace
 
-int runCartesianForceProgram(int argc, char* argv[], CartesianForceMode mode) {
+int runCartesianForceProgram(int argc, char* argv[], CartesianForceMode mode,
+                             const char* program_name) {
   const bool hybrid = mode == CartesianForceMode::hybrid;
   const bool adaptive_tracking = mode == CartesianForceMode::iac1_tracking;
-  const bool adaptive = mode == CartesianForceMode::iac1 || adaptive_tracking;
-  const std::string name = hybrid ? "cartesian_hybrid_control"
+  const bool sequential = mode == CartesianForceMode::iac1_hybrid;
+  const bool adaptive = mode == CartesianForceMode::iac1 || adaptive_tracking || sequential;
+  const std::string name = program_name ? program_name
+      : hybrid ? "cartesian_hybrid_control"
+      : sequential ? "cartesian_iac1_hybrid_control"
       : adaptive_tracking ? "cartesian_iac1_tracking_control"
       : adaptive ? "cartesian_iac1_control" : "cartesian_force_control";
   const bool help = argc == 2 && std::string_view(argv[1]) == "--help";
-  const bool valid_arg_count = argc == (hybrid ? 3 : 2);
+  const bool valid_arg_count = argc == (adaptive || hybrid ? 3 : 2);
   if (help || !valid_arg_count) {
-    std::cout << "Usage: " << argv[0] << (hybrid ? " FORCE_N DX_M\n" : " FORCE_N\n")
-              << (adaptive_tracking ? "Track an x/z trajectory and compression with an adaptive normal.\n"
-                           : adaptive ? "Regulate an x/z target with IAC1 using joints 2 and 4.\n"
+    std::cout << "Usage: " << argv[0]
+              << (sequential ? " FORCE_N TANGENT_M\n"
+                            : adaptive || hybrid ? " FORCE_N DX_M\n" : " FORCE_N\n")
+              << (sequential ? "Estimate the normal with IAC1, then run hybrid control.\n"
+                           : adaptive_tracking ? "Track x motion and compression with an adaptive normal.\n"
+                           : adaptive ? "Regulate a fixed x/z position with IAC1.\n"
                            : "Regulate downward force in base z using joints 2 and 4.\n")
               << "Enter h to return to the joint position captured at startup.\n"
               << "Enter t to move to the approach pose, then c to start force control.\n"
@@ -672,9 +794,13 @@ int runCartesianForceProgram(int argc, char* argv[], CartesianForceMode mode) {
       std::cout << "DX_M is a signed one-way x displacement in meters.\n"
                 << "Set the x move duration with x_motion_s in the config file.\n"
                 << "The x trajectory and z-force ramp start together on c.\n"
-                << "Settings: config/cartesian_hybrid_control.conf.\n";
+                << "Settings: config/" << name << ".conf.\n";
+    } else if (sequential) {
+      std::cout << "TANGENT_M is signed travel along the estimated surface, in meters.\n"
+                << "Use a low-friction surface. Settings: config/" << name << ".conf.\n";
     } else if (adaptive) {
-      std::cout << "Use a low-friction surface. Settings: config/" << name << ".conf.\n";
+      std::cout << "DX_M is a signed base-frame x offset in meters from first contact.\n"
+                << "Use a low-friction surface. Settings: config/" << name << ".conf.\n";
     } else {
       std::cout << "Settings: config/cartesian_contact.conf and config/cartesian_force_control.conf.\n";
     }
@@ -689,7 +815,7 @@ int runCartesianForceProgram(int argc, char* argv[], CartesianForceMode mode) {
   try {
     const auto config_path = project / "config" / (name + ".conf");
     std::map<std::string, double*> keys{{"contact_loss_N", &settings.contact_loss}};
-    if (!adaptive || adaptive_tracking) {
+    if (!adaptive || adaptive_tracking || sequential) {
       keys.insert({{"force_kp", &gains.kp}, {"force_ki", &gains.ki}});
     }
     if (hybrid) {
@@ -706,8 +832,7 @@ int runCartesianForceProgram(int argc, char* argv[], CartesianForceMode mode) {
                           {"force_kp", "force_ki", "x_kp", "x_kd", "x_ki", "x_final_hold_s"});
     } else if (adaptive) {
       keys.insert({
-          {"run_duration_s", &settings.duration}, {"target_x_offset_m", &iac.target_offset.x()},
-          {"target_z_offset_m", &iac.target_offset.y()}, {"nominal_angle_rad", &iac.nominal_angle},
+          {"run_duration_s", &settings.duration}, {"nominal_angle_rad", &iac.nominal_angle},
           {"initial_effective_angle_rad", &iac.initial_angle},
           {"max_angle_offset_rad", &iac.max_angle_offset}, {"adaptation_gamma", &iac.gamma},
           {"motion_kp", &iac.kp}, {"motion_kv", &iac.kv},
@@ -717,24 +842,36 @@ int runCartesianForceProgram(int argc, char* argv[], CartesianForceMode mode) {
           {"max_x_speed_m_s", &iac.max_x_speed}, {"max_target_offset_m", &iac.max_target_offset},
           {"max_task_wrench_N", &iac.max_task_wrench},
       });
-      if (adaptive_tracking) {
+      if (adaptive_tracking || sequential) {
         keys.emplace("trajectory_duration_s", &iac.trajectory_seconds);
       }
+      if (sequential) {
+        keys.emplace("estimation_duration_s", &iac.estimation_seconds);
+        keys.emplace("estimation_timeout_s", &iac.estimation_timeout);
+        keys.emplace("convergence_window_s", &iac.convergence_window);
+        keys.emplace("convergence_angle_range_rad", &iac.convergence_angle_range);
+        keys.emplace("tangent_travel_margin_m", &iac.tangent_travel_margin);
+        keys.emplace("jacobian_filter_time_s", &iac.jacobian_filter_time);
+        keys.emplace("tangent_kp", &iac.tangent_kp);
+        keys.emplace("tangent_kv", &iac.tangent_kv);
+        keys.emplace("tangent_ki", &iac.tangent_ki);
+        keys.emplace("tangent_integral_limit_m_s2", &iac.tangent_integral_limit);
+      }
       loadContactSettings(config_path, settings, keys,
-                          {"target_x_offset_m", "target_z_offset_m",
-                           "nominal_angle_rad", "initial_effective_angle_rad",
-                           "force_kp", "force_ki"}, adaptive_tracking);
+                          {"nominal_angle_rad", "initial_effective_angle_rad",
+                           "force_kp", "force_ki"}, adaptive_tracking || sequential);
       if (std::abs(iac.nominal_angle) + iac.max_angle_offset >= std::acos(0.0) ||
           std::abs(iac.initial_angle - iac.nominal_angle) > iac.max_angle_offset ||
-          iac.target_offset.norm() > std::min(iac.max_target_offset, settings.max_tool_travel) ||
           settings.max_target > iac.max_task_wrench) {
-        throw std::runtime_error("IAC1 angle, target offset, or wrench bounds are inconsistent");
+        throw std::runtime_error("IAC1 angle or wrench bounds are inconsistent");
       }
-      if (adaptive_tracking &&
-          (iac.trajectory_seconds > settings.duration ||
-           1.875 * std::abs(iac.target_offset.x()) / iac.trajectory_seconds > iac.max_x_speed ||
-           1.875 * std::abs(iac.target_offset.y()) / iac.trajectory_seconds > settings.max_z_speed)) {
-        throw std::runtime_error("IAC1 trajectory exceeds the configured run time or speed limits");
+      if ((adaptive_tracking || sequential) && iac.trajectory_seconds > settings.duration) {
+        throw std::runtime_error("IAC1 trajectory exceeds the configured run time");
+      }
+      if (sequential && (iac.estimation_timeout <= iac.estimation_seconds ||
+                         iac.estimation_timeout <= iac.convergence_window ||
+                         iac.convergence_angle_range >= iac.max_angle_offset)) {
+        throw std::runtime_error("IAC1 convergence settings are inconsistent");
       }
     } else {
       loadContactSettings(project / "config" / "cartesian_contact.conf", settings);
@@ -785,6 +922,25 @@ int runCartesianForceProgram(int argc, char* argv[], CartesianForceMode mode) {
                                     "(minimum " + std::to_string(minimum_seconds) + " s)");
       }
     }
+    if (adaptive) {
+      const std::string offset(argv[2]);
+      const std::string direction = sequential ? "tangential" : "x";
+      iac.target_x_offset = std::stod(offset, &end);
+      if (end != offset.size() || !std::isfinite(iac.target_x_offset)) {
+        throw std::invalid_argument("IAC1 " + direction + " offset must be a finite number");
+      }
+      const double max_offset = iac.max_target_offset;
+      if (std::abs(iac.target_x_offset) > max_offset) {
+        throw std::invalid_argument("IAC1 " + direction + " offset magnitude must be at most " +
+                                    std::to_string(max_offset) + " m");
+      }
+      const double speed_limit = sequential ? std::min(iac.max_x_speed, settings.max_z_speed)
+                                            : iac.max_x_speed;
+      if ((adaptive_tracking || sequential) &&
+          1.875 * std::abs(iac.target_x_offset) / iac.trajectory_seconds > speed_limit) {
+        throw std::invalid_argument("IAC1 trajectory exceeds the configured speed limit");
+      }
+    }
   } catch (const std::exception& error) {
     std::cerr << "Invalid control argument: " << error.what() << '\n';
     return 2;
@@ -797,7 +953,8 @@ int runCartesianForceProgram(int argc, char* argv[], CartesianForceMode mode) {
     std::vector<Sample> samples;
     const double max_duration = hybrid
         ? motion.motion_seconds + motion.hold_seconds + settings.ramp_seconds
-        : settings.duration + (adaptive ? settings.contact_timeout : 0.0);
+        : settings.duration + (adaptive ? settings.contact_timeout : 0.0) +
+            (sequential ? iac.estimation_timeout : 0.0);
     const double capacity = std::ceil(max_duration * 1000.0) + 100.0;
     if (capacity >= static_cast<double>(samples.max_size())) {
       throw std::runtime_error("Configured duration exceeds the log capacity");
@@ -841,7 +998,9 @@ int runCartesianForceProgram(int argc, char* argv[], CartesianForceMode mode) {
           continue;
         }
         std::cout << "Joint pose reached. External wrench and joint torque zeroed. "
-                  << "Captured z-force offset: " << baseline.wrench[2] << " N.\n";
+                  << "Captured base-frame force offsets in N (x, y, z): "
+                  << baseline.wrench[0] << ", " << baseline.wrench[1] << ", "
+                  << baseline.wrench[2] << ".\n";
       }
       if (key == 'c') {
         if (!pose_reached) {

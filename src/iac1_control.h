@@ -20,6 +20,26 @@ inline Vector normal(double angle) {
   return {-std::sin(angle), std::cos(angle)};
 }
 
+struct AngleStability {
+  double start = -1.0;
+  double minimum = 0.0;
+  double maximum = 0.0;
+
+  void observe(double angle, double elapsed, double tolerance) {
+    if (start < 0.0 || std::max(maximum, angle) - std::min(minimum, angle) > tolerance) {
+      start = elapsed;
+      minimum = maximum = angle;
+    } else {
+      minimum = std::min(minimum, angle);
+      maximum = std::max(maximum, angle);
+    }
+  }
+
+  double stableSeconds(double elapsed) const {
+    return start < 0.0 ? 0.0 : elapsed - start;
+  }
+};
+
 struct Reference {
   Vector position;
   Vector velocity;
@@ -72,6 +92,16 @@ inline bool modelRates(const franka::Model& model, const franka::RobotState& sta
 inline double momentumCorrection(double gamma, const Vector& nominal_tangent,
                                  const Matrix& inertia, const Vector& velocity) {
   return gamma * nominal_tangent.dot(inertia * velocity);
+}
+
+inline Vector xMotionWrench(const planar_dynamics::Dynamics& dynamics, double x_acceleration) {
+  return {dynamics.inertia(0, 0) * x_acceleration + dynamics.bias.x(), 0.0};
+}
+
+inline Vector tangentMotionWrench(const planar_dynamics::Dynamics& dynamics,
+                                  const Vector& tangent, double acceleration) {
+  return tangent * (tangent.dot(dynamics.inertia * tangent) * acceleration +
+                    tangent.dot(dynamics.bias));
 }
 
 inline double estimatorRate(double gamma, const Vector& nominal_tangent,

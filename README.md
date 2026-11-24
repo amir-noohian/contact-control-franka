@@ -279,7 +279,7 @@ clear of contact when `t` settles. The controller captures the estimated
 external wrench and all seven external joint torques at that pose and subtracts
 the captured values during the `c` run. Force feedback uses the corrected
 base-frame z component, with upward reaction on the arm positive. The CSV also
-records the captured z-force and joint-torque offsets.
+records the captured x, y, and z force offsets and joint-torque offsets.
 The controller sends the negative of the feedforward plus PI force through
 the z row of the Jacobian transpose for joints 2 and 4. Franka handles
 gravity and friction compensation.
@@ -368,7 +368,7 @@ python plot/plot_cartesian_hybrid_control.py data/cartesian_hybrid_control/002.c
 
 ```bash
 source scripts/franka_env.sh
-./build/cartesian_iac1_control 2.0
+./build/cartesian_iac1_control 2.0 0.0
 ```
 
 Use `t` to move to the preset pose and tare the wrench with the tool clear
@@ -378,16 +378,20 @@ IAC1 runs for `run_duration_s` with constant desired compression. The other
 five joints hold their starting angles. Enter `h` at the prompt to return
 to the startup pose.
 
-Set all parameters in `config/cartesian_iac1_control.conf`. The target is a
-fixed Cartesian point. The default is the first confirmed contact point.
-Use `target_x_offset_m` and `target_z_offset_m` to shift that point along the
-surface. The normal points into free space and is parameterized as
+Pass the desired compression in newtons, followed by a signed base-frame x
+offset in meters from first confirmed contact, up to 0.10 m in magnitude
+with the supplied config. The z setpoint remains the
+contact height. The example holds the contact point while applying force. Set gains and limits
+in `config/cartesian_iac1_control.conf`.
+The normal points into free space and is parameterized as
 $[-\sin\theta,\cos\theta]^T$ in base-frame x/z. Use a low-friction surface
 because the offset-corrected x/z force magnitude is used as the scalar
 contact-force estimate and includes any tangential force.
 
-The wrench uses full reduced Cartesian inverse dynamics and the constant
-desired force along the effective normal. The estimator integrates the
+The original IAC1 law uses a fixed x/z position reference with zero desired
+velocity and acceleration. It adds the full reduced Cartesian inverse-dynamics
+wrench to the constant desired force along the effective normal. The estimator
+uses the inertia-scaled motion acceleration in its update and integrates the
 IAC1 angle state using the actual sample period and a centered directional
 difference of the libfranka model for $\dot\Lambda$. Angle integration is
 paused when a user torque limit intervenes. Franka supplies gravity and
@@ -419,17 +423,17 @@ startup.
 
 ```bash
 source scripts/franka_env.sh
-./build/cartesian_iac1_tracking_control 2.0
+./build/cartesian_iac1_tracking_control 2.0 0.01
 ```
 
 The tracking variant uses the same tare and bounded contact search as IAC1.
 After contact is confirmed, position, velocity, and acceleration references
-follow a one-way quintic from the contact point to the configured x/z
-offset. Set the offsets so the path lies on the surface. The reference is
-fixed in the base frame and the estimated normal adapts the force direction.
-The supplied offsets are zero for a stationary force-tracking test.
-Set `target_x_offset_m` to `0.01` for a 10 mm move along x. With the
-supplied timing, that move takes 10 s and holds the endpoint for 2 s.
+follow a one-way quintic from the contact point along base-frame x.
+Along z, the adaptive force command supplies the entire wrench component.
+Pass a signed x offset of up to 0.10 m, or zero for a stationary
+force-tracking test.
+The example moves 10 mm along x in 10 s and holds the endpoint for 2 s
+with the supplied timing.
 
 The force term is $-\bar n u_f$, where $u_f$ is the requested compression
 plus PI feedback, bounded by the configured command limit. The estimator
@@ -438,7 +442,7 @@ force target in its update, so it accounts for changes from the PI loop.
 The integrator is active in confirmed contact and pauses when the joint
 torque limits intervene. Feedback still uses the tared x/z force magnitude.
 
-Set the path, force PI gains, and limits in
+Set the trajectory duration, force PI gains, and limits in
 `config/cartesian_iac1_tracking_control.conf`. Numbered CSVs in
 `data/cartesian_iac1_tracking_control/` include trajectory derivatives and
 the scalar commanded compression. The tracking plotter opens the latest
@@ -448,4 +452,67 @@ tracking run by default and also accepts a specific CSV path.
 source .venv/bin/activate
 python plot/plot_cartesian_iac1_tracking_control.py
 python plot/plot_cartesian_iac1_tracking_control.py data/cartesian_iac1_tracking_control/001.csv
+```
+
+### IAC1 estimation followed by hybrid control
+
+```bash
+source scripts/franka_env.sh
+./build/cartesian_iac1_hybrid_control 4.0 0.10
+```
+
+Enter `t` to reach the preset pose and tare in free space, then `c` to start.
+After contact, the original fixed-setpoint IAC1 law estimates the normal
+while holding the contact point. The hybrid stage starts after at least
+five seconds of estimation and a one-second window in which the effective
+angle varies by at most 0.5°. If the angle fails that test within 20 seconds,
+the controller stops before traversing. This is a stability check on the
+estimate. It does not validate the angle against the physical surface.
+
+The example freezes the effective normal and traverses 10 cm along the
+corresponding tangent in 25 seconds. The second argument is signed distance
+in meters along that tangent. Enter zero for a force hold.
+
+In the hybrid stage, motion feedback acts along the frozen tangent and
+feedforward plus PI regulates the tared force projected onto the frozen
+normal. The supplied tangential motion and force gains match the
+conventional hybrid controller. The motion integral runs during the
+endpoint hold. The two wrench contributions are summed and mapped through
+the x/z Jacobian transpose. The effective angle remains fixed during the
+traverse. The force target stays constant through the endpoint hold, then
+the control session ends.
+
+Timing, gains, and limits are in `config/cartesian_iac1_hybrid_control.conf`.
+Logs under `data/cartesian_iac1_hybrid_control/` record the normal and mark
+the switch into hybrid control. The dedicated plotter shows desired and measured travel
+along the frozen surface tangent and opens the latest run by default.
+
+```bash
+source .venv/bin/activate
+python plot/plot_cartesian_iac1_hybrid_control.py
+python plot/plot_cartesian_iac1_hybrid_control.py data/cartesian_iac1_hybrid_control/001.csv --output iac1_hybrid.png
+```
+
+### Hybrid runs for external force and joint torque measurements
+
+`cartesian_hybrid_external_control` uses the conventional hybrid control law
+and reads `config/cartesian_hybrid_external_control.conf`. Enter `t` in free space
+to tare, then enter `c` to run and record the experiment.
+
+```bash
+source scripts/franka_env.sh
+./build/cartesian_hybrid_external_control 2.0 0.01
+```
+
+Numbered CSVs in `data/cartesian_hybrid_external_control/` record the estimated
+external force on the tool in base-frame x, y, and z and the estimated external
+torque on all seven joints, with the offsets captured at `t` subtracted.
+The plotter includes the desired z-force reference and desired and measured
+x position. It opens the latest run by default and also accepts a CSV path
+from the conventional hybrid controller.
+
+```bash
+source .venv/bin/activate
+python plot/plot_cartesian_hybrid_external_control.py
+python plot/plot_cartesian_hybrid_external_control.py data/cartesian_hybrid_external_control/001.csv --output hybrid_external.png
 ```

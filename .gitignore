@@ -5,5 +5,7 @@ __pycache__/
 /data/cartesian_computed_torque/*.csv
 /data/cartesian_force_control/*.csv
 /data/cartesian_hybrid_control/*.csv
+/data/cartesian_hybrid_external_control/*.csv
 /data/cartesian_iac1_control/*.csv
 /data/cartesian_iac1_tracking_control/*.csv
+/data/cartesian_iac1_hybrid_control/*.csv

@@ -187,11 +187,15 @@ struct Iac1Settings {
   double nominal_angle{}, initial_angle{}, max_angle_offset{}, gamma{};
   double kp{}, kv{}, max_acceleration{}, difference_step{}, min_singular_value{};
   double max_x_speed{}, max_target_offset{}, max_task_wrench{};
+  double trajectory_seconds{};
 };
 
 struct Iac1Sample {
   planar_dynamics::Vector target = planar_dynamics::Vector::Zero();
+  planar_dynamics::Vector target_velocity = planar_dynamics::Vector::Zero();
+  planar_dynamics::Vector target_acceleration = planar_dynamics::Vector::Zero();
   double normal_force{}, estimate{}, effective_angle{}, estimator_rate{};
+  double commanded_compression{};
 };
 
 struct MotionReference {
@@ -296,6 +300,8 @@ const char* run(franka::Robot& robot, const franka::Model& model, const Gains& g
   const Vector nominal_normal = adaptive ? iac1::normal(adaptive->nominal_angle) : Vector::Zero();
   double iac_start = -1.0;
   Iac1Sample iac;
+  Vector contact_position = Vector::Zero();
+  const bool adaptive_tracking = adaptive && adaptive->trajectory_seconds > 0.0;
   const char* reason = nullptr;
 
   robot.control([&](const franka::RobotState& state, franka::Duration period) -> franka::Torques {
@@ -448,6 +454,9 @@ const char* run(franka::Robot& robot, const franka::Model& model, const Gains& g
         return finish("IAC1 x speed limit exceeded");
       }
       iac.normal_force = measured;
+      iac.commanded_compression = adaptive_tracking && in_contact
+          ? std::clamp(raw_force, 0.0, settings.max_force_command)
+          : reference;
       const Vector position(x, z);
       Vector used_normal = nominal_normal;
       if (in_contact) {
@@ -468,8 +477,16 @@ const char* run(franka::Robot& robot, const franka::Model& model, const Gains& g
             adaptive->gamma, nominal_tangent, dynamics.inertia, velocity);
         if (iac_start < 0.0) {
           iac_start = elapsed;
-          iac.target = position + adaptive->target_offset;
+          contact_position = position;
+          iac.target = contact_position + adaptive->target_offset;
           iac.estimate = adaptive->initial_angle + correction;
+        }
+        if (adaptive_tracking) {
+          const auto desired = iac1::trajectory(contact_position, adaptive->target_offset,
+                                                elapsed - iac_start, adaptive->trajectory_seconds);
+          iac.target = desired.position;
+          iac.target_velocity = desired.velocity;
+          iac.target_acceleration = desired.acceleration;
         }
         iac.effective_angle = iac.estimate - correction;
         if (!std::isfinite(iac.effective_angle) ||
@@ -477,14 +494,15 @@ const char* run(franka::Robot& robot, const franka::Model& model, const Gains& g
           return finish("IAC1 effective angle exceeded its configured bound");
         }
         used_normal = iac1::normal(iac.effective_angle);
-        const Vector acceleration = adaptive->kp * (iac.target - position) - adaptive->kv * velocity;
+        const Vector acceleration = iac.target_acceleration + adaptive->kp * (iac.target - position) +
+                                    adaptive->kv * (iac.target_velocity - velocity);
         if (!acceleration.allFinite() || acceleration.norm() > adaptive->max_acceleration) {
           return finish("IAC1 motion acceleration exceeded its configured bound");
         }
         const Vector motion_wrench = dynamics.inertia * acceleration;
         iac.estimator_rate = iac1::estimatorRate(adaptive->gamma, nominal_tangent, motion_wrench,
                                                 rates.inertia_rate, velocity, used_normal,
-                                                measured, target);
+                                                measured, iac.commanded_compression);
         wrench = dynamics.bias + motion_wrench;
         if (!std::isfinite(iac.estimator_rate)) {
           return finish("IAC1 estimator rate is invalid");
@@ -494,7 +512,7 @@ const char* run(franka::Robot& robot, const franka::Model& model, const Gains& g
         iac.effective_angle = adaptive->nominal_angle;
         iac.estimate = adaptive->initial_angle;
       }
-      const Vector contact_wrench = -reference * used_normal;
+      const Vector contact_wrench = -iac.commanded_compression * used_normal;
       command_z = contact_wrench.y();
       wrench += contact_wrench;
       if (!wrench.allFinite() || wrench.norm() > adaptive->max_task_wrench) {
@@ -543,7 +561,7 @@ const char* run(franka::Robot& robot, const franka::Model& model, const Gains& g
     if (adaptive && in_contact && !active_limited) {
       iac.estimate += dt * iac.estimator_rate;
     }
-    if (!adaptive && in_contact && !active_limited &&
+    if ((!adaptive || adaptive_tracking) && in_contact && !active_limited &&
         ((raw_force > 0.0 && raw_force < settings.max_force_command) ||
          drives_out_of_force_saturation)) {
       integral_force = std::clamp(integral_force + (gains.ki * dt) * error,
@@ -563,7 +581,8 @@ const char* run(franka::Robot& robot, const franka::Model& model, const Gains& g
 void writeLog(std::ostream& log, const std::vector<Sample>& samples, double requested_force,
               const ExternalEstimate& baseline, CartesianForceMode mode) {
   const bool hybrid = mode == CartesianForceMode::hybrid;
-  const bool adaptive = mode == CartesianForceMode::iac1;
+  const bool adaptive_tracking = mode == CartesianForceMode::iac1_tracking;
+  const bool adaptive = mode == CartesianForceMode::iac1 || adaptive_tracking;
   log << std::setprecision(17)
       << "elapsed_s,x_m,z_m,force_ref_N,external_fz_N,integral_force_N,command_fz_N";
   for (int j = 1; j <= 7; ++j) {
@@ -581,6 +600,9 @@ void writeLog(std::ostream& log, const std::vector<Sample>& samples, double requ
   if (adaptive) {
     log << ",x_ref_m,z_ref_m,normal_force_N,angle_estimate_rad,effective_angle_rad,"
            "angle_estimator_rate_rad_s,command_fx_N,total_command_fz_N";
+  }
+  if (adaptive_tracking) {
+    log << ",dx_ref_m_s,dz_ref_m_s,ddx_ref_m_s2,ddz_ref_m_s2,normal_command_N";
   }
   if (hybrid || adaptive) {
     for (int joint = 1; joint <= 7; ++joint) {
@@ -611,6 +633,12 @@ void writeLog(std::ostream& log, const std::vector<Sample>& samples, double requ
           << ',' << iac.estimate << ',' << iac.effective_angle << ',' << iac.estimator_rate
           << ',' << s.command_x << ',' << s.total_command_z;
     }
+    if (adaptive_tracking) {
+      const auto& iac = s.adaptive;
+      log << ',' << iac.target_velocity.x() << ',' << iac.target_velocity.y()
+          << ',' << iac.target_acceleration.x() << ',' << iac.target_acceleration.y()
+          << ',' << iac.commanded_compression;
+    }
     if (hybrid || adaptive) {
       for (double angle : s.q) {
         log << ',' << angle;
@@ -624,12 +652,17 @@ void writeLog(std::ostream& log, const std::vector<Sample>& samples, double requ
 
 int runCartesianForceProgram(int argc, char* argv[], CartesianForceMode mode) {
   const bool hybrid = mode == CartesianForceMode::hybrid;
-  const bool adaptive = mode == CartesianForceMode::iac1;
+  const bool adaptive_tracking = mode == CartesianForceMode::iac1_tracking;
+  const bool adaptive = mode == CartesianForceMode::iac1 || adaptive_tracking;
+  const std::string name = hybrid ? "cartesian_hybrid_control"
+      : adaptive_tracking ? "cartesian_iac1_tracking_control"
+      : adaptive ? "cartesian_iac1_control" : "cartesian_force_control";
   const bool help = argc == 2 && std::string_view(argv[1]) == "--help";
   const bool valid_arg_count = argc == (hybrid ? 3 : 2);
   if (help || !valid_arg_count) {
     std::cout << "Usage: " << argv[0] << (hybrid ? " FORCE_N DX_M\n" : " FORCE_N\n")
-              << (adaptive ? "Regulate an x/z target with IAC1 using joints 2 and 4.\n"
+              << (adaptive_tracking ? "Track an x/z trajectory and compression with an adaptive normal.\n"
+                           : adaptive ? "Regulate an x/z target with IAC1 using joints 2 and 4.\n"
                            : "Regulate downward force in base z using joints 2 and 4.\n")
               << "Enter h to return to the joint position captured at startup.\n"
               << "Enter t to move to the approach pose, then c to start force control.\n"
@@ -641,7 +674,7 @@ int runCartesianForceProgram(int argc, char* argv[], CartesianForceMode mode) {
                 << "The x trajectory and z-force ramp start together on c.\n"
                 << "Settings: config/cartesian_hybrid_control.conf.\n";
     } else if (adaptive) {
-      std::cout << "Use a low-friction surface. Settings: config/cartesian_iac1_control.conf.\n";
+      std::cout << "Use a low-friction surface. Settings: config/" << name << ".conf.\n";
     } else {
       std::cout << "Settings: config/cartesian_contact.conf and config/cartesian_force_control.conf.\n";
     }
@@ -649,8 +682,6 @@ int runCartesianForceProgram(int argc, char* argv[], CartesianForceMode mode) {
   }
 
   const std::filesystem::path project(FRANKA_PROJECT_DIR);
-  const std::string name = hybrid ? "cartesian_hybrid_control"
-      : (adaptive ? "cartesian_iac1_control" : "cartesian_force_control");
   ContactSettings settings;
   HybridMotion motion;
   Iac1Settings iac;
@@ -658,7 +689,7 @@ int runCartesianForceProgram(int argc, char* argv[], CartesianForceMode mode) {
   try {
     const auto config_path = project / "config" / (name + ".conf");
     std::map<std::string, double*> keys{{"contact_loss_N", &settings.contact_loss}};
-    if (!adaptive) {
+    if (!adaptive || adaptive_tracking) {
       keys.insert({{"force_kp", &gains.kp}, {"force_ki", &gains.ki}});
     }
     if (hybrid) {
@@ -686,14 +717,24 @@ int runCartesianForceProgram(int argc, char* argv[], CartesianForceMode mode) {
           {"max_x_speed_m_s", &iac.max_x_speed}, {"max_target_offset_m", &iac.max_target_offset},
           {"max_task_wrench_N", &iac.max_task_wrench},
       });
+      if (adaptive_tracking) {
+        keys.emplace("trajectory_duration_s", &iac.trajectory_seconds);
+      }
       loadContactSettings(config_path, settings, keys,
                           {"target_x_offset_m", "target_z_offset_m",
-                           "nominal_angle_rad", "initial_effective_angle_rad"}, false);
+                           "nominal_angle_rad", "initial_effective_angle_rad",
+                           "force_kp", "force_ki"}, adaptive_tracking);
       if (std::abs(iac.nominal_angle) + iac.max_angle_offset >= std::acos(0.0) ||
           std::abs(iac.initial_angle - iac.nominal_angle) > iac.max_angle_offset ||
           iac.target_offset.norm() > std::min(iac.max_target_offset, settings.max_tool_travel) ||
           settings.max_target > iac.max_task_wrench) {
         throw std::runtime_error("IAC1 angle, target offset, or wrench bounds are inconsistent");
+      }
+      if (adaptive_tracking &&
+          (iac.trajectory_seconds > settings.duration ||
+           1.875 * std::abs(iac.target_offset.x()) / iac.trajectory_seconds > iac.max_x_speed ||
+           1.875 * std::abs(iac.target_offset.y()) / iac.trajectory_seconds > settings.max_z_speed)) {
+        throw std::runtime_error("IAC1 trajectory exceeds the configured run time or speed limits");
       }
     } else {
       loadContactSettings(project / "config" / "cartesian_contact.conf", settings);

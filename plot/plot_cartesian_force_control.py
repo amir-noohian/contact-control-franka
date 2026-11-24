@@ -21,14 +21,14 @@ def latest_run(directory=DATA_DIR):
     raise ValueError(f"No run with recorded samples found in {directory}")
 
 
-def read_run(path, required=REQUIRED):
+def read_run(path, required=REQUIRED, optional=("force_target_N",)):
     with path.open(newline="") as stream:
         rows = csv.DictReader(stream)
         fields = set(rows.fieldnames or ())
         missing = set(required) - fields
         if missing:
             raise ValueError(f"Missing columns: {', '.join(sorted(missing))}")
-        names = (*required, "force_target_N") if "force_target_N" in fields else required
+        names = (*required, *(name for name in optional if name in fields))
         data = {key: [] for key in names}
         for row in rows:
             try:

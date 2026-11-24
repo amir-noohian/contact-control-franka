@@ -42,3 +42,6 @@ target_link_libraries(cartesian_hybrid_control PRIVATE cartesian_force_program)
 
 add_executable(cartesian_iac1_control src/cartesian_iac1_control.cpp)
 target_link_libraries(cartesian_iac1_control PRIVATE cartesian_force_program)
+
+add_executable(cartesian_iac1_tracking_control src/cartesian_iac1_tracking_control.cpp)
+target_link_libraries(cartesian_iac1_tracking_control PRIVATE cartesian_force_program)

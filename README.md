@@ -406,9 +406,46 @@ python plot/plot_cartesian_iac1_control.py
 python plot/plot_cartesian_iac1_control.py data/cartesian_iac1_control/001.csv --output iac1_run.png
 ```
 
-For a flat surface, the configured `initial_effective_angle_rad` starts
-adaptation with a +10° error. To plot the signed effective-normal error
+For a flat surface, set `initial_effective_angle_rad` to `0.0` for an
+aligned baseline, `0.0872664626` for +5°, `0.1745329252` for +10°, or
+`0.3490658504` for +20°.
+To plot the signed effective-normal error
 after contact, pass `--surface-angle-deg 0` for a flat surface or enter the
 known signed surface tilt from +x toward +z. This angle is used only for the
 plot. The controller reads the initial effective angle from its config at
 startup.
+
+### IAC1 with trajectory and force-magnitude feedback
+
+```bash
+source scripts/franka_env.sh
+./build/cartesian_iac1_tracking_control 2.0
+```
+
+The tracking variant uses the same tare and bounded contact search as IAC1.
+After contact is confirmed, position, velocity, and acceleration references
+follow a one-way quintic from the contact point to the configured x/z
+offset. Set the offsets so the path lies on the surface. The reference is
+fixed in the base frame and the estimated normal adapts the force direction.
+The supplied offsets are zero for a stationary force-tracking test.
+Set `target_x_offset_m` to `0.01` for a 10 mm move along x. With the
+supplied timing, that move takes 10 s and holds the endpoint for 2 s.
+
+The force term is $-\bar n u_f$, where $u_f$ is the requested compression
+plus PI feedback, bounded by the configured command limit. The estimator
+uses the applied task-level force command $u_f$ in place of the constant
+force target in its update, so it accounts for changes from the PI loop.
+The integrator is active in confirmed contact and pauses when the joint
+torque limits intervene. Feedback still uses the tared x/z force magnitude.
+
+Set the path, force PI gains, and limits in
+`config/cartesian_iac1_tracking_control.conf`. Numbered CSVs in
+`data/cartesian_iac1_tracking_control/` include trajectory derivatives and
+the scalar commanded compression. The tracking plotter opens the latest
+tracking run by default and also accepts a specific CSV path.
+
+```bash
+source .venv/bin/activate
+python plot/plot_cartesian_iac1_tracking_control.py
+python plot/plot_cartesian_iac1_tracking_control.py data/cartesian_iac1_tracking_control/001.csv
+```

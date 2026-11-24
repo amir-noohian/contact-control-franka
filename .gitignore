@@ -6,3 +6,4 @@ __pycache__/
 /data/cartesian_force_control/*.csv
 /data/cartesian_hybrid_control/*.csv
 /data/cartesian_iac1_control/*.csv
+/data/cartesian_iac1_tracking_control/*.csv

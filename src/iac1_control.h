@@ -4,6 +4,7 @@
 
 #include <franka/robot_state.h>
 
+#include <algorithm>
 #include <cmath>
 
 namespace iac1 {
@@ -17,6 +18,21 @@ inline Vector tangent(double angle) {
 
 inline Vector normal(double angle) {
   return {-std::sin(angle), std::cos(angle)};
+}
+
+struct Reference {
+  Vector position;
+  Vector velocity;
+  Vector acceleration;
+};
+
+inline Reference trajectory(const Vector& start, const Vector& offset,
+                            double elapsed, double duration) {
+  const double s = std::clamp(elapsed / duration, 0.0, 1.0);
+  const double blend = s * s * s * (10.0 + s * (-15.0 + 6.0 * s));
+  const double speed = 30.0 * s * s * (1.0 - s) * (1.0 - s) / duration;
+  const double acceleration = 60.0 * s * (1.0 - s) * (1.0 - 2.0 * s) / (duration * duration);
+  return {start + blend * offset, speed * offset, acceleration * offset};
 }
 
 struct ModelRates {
@@ -61,9 +77,10 @@ inline double momentumCorrection(double gamma, const Vector& nominal_tangent,
 inline double estimatorRate(double gamma, const Vector& nominal_tangent,
                             const Vector& motion_wrench, const Matrix& inertia_rate,
                             const Vector& velocity, const Vector& effective_normal,
-                            double measured_force, double desired_force) {
+                            double measured_force, double commanded_compression) {
   return gamma * nominal_tangent.dot(
-      motion_wrench + inertia_rate * velocity + effective_normal * (measured_force - desired_force));
+      motion_wrench + inertia_rate * velocity +
+      effective_normal * (measured_force - commanded_compression));
 }
 
 }  // namespace iac1

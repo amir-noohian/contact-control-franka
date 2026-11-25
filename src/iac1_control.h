@@ -94,10 +94,6 @@ inline double momentumCorrection(double gamma, const Vector& nominal_tangent,
   return gamma * nominal_tangent.dot(inertia * velocity);
 }
 
-inline Vector xMotionWrench(const planar_dynamics::Dynamics& dynamics, double x_acceleration) {
-  return {dynamics.inertia(0, 0) * x_acceleration + dynamics.bias.x(), 0.0};
-}
-
 inline Vector tangentMotionWrench(const planar_dynamics::Dynamics& dynamics,
                                   const Vector& tangent, double acceleration) {
   return tangent * (tangent.dot(dynamics.inertia * tangent) * acceleration +

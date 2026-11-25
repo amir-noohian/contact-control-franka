@@ -419,40 +419,46 @@ known signed surface tilt from +x toward +z. This angle is used only for the
 plot. The controller reads the initial effective angle from its config at
 startup.
 
-### IAC1 with trajectory and force-magnitude feedback
+### IAC1E2 task-space tracking with direct force feedback
 
 ```bash
 source scripts/franka_env.sh
 ./build/cartesian_iac1_tracking_control 2.0 0.01
 ```
 
-The tracking variant uses the same tare and bounded contact search as IAC1.
-After contact is confirmed, position, velocity, and acceleration references
-follow a one-way quintic from the contact point along base-frame x.
-Along z, the adaptive force command supplies the entire wrench component.
-Pass a signed x offset of up to 0.10 m, or zero for a stationary
-force-tracking test.
-The example moves 10 mm along x in 10 s and holds the endpoint for 2 s
-with the supplied timing.
+After the IAC1 tare and bounded contact search, the controller tracks a
+quintic Cartesian reference from the confirmed contact point. Supply signed
+base-frame offsets as `FORCE_N DX_M [DZ_M]`. The optional z offset defaults
+to zero. Choose offsets along the fixed contact line. For stationary
+regulation, set both offsets to zero. The example moves 10 mm along x in
+`trajectory_duration_s`. Any additional time in `run_duration_s` holds the
+endpoint.
 
-The force term is $-\bar n u_f$, where $u_f$ is the requested compression
-plus PI feedback, bounded by the configured command limit. The estimator
-uses the applied task-level force command $u_f$ in place of the constant
-force target in its update, so it accounts for changes from the PI loop.
-The integrator is active in confirmed contact and pauses when the joint
-torque limits intervene. Feedback still uses the tared x/z force magnitude.
+The controller uses full x/z position, velocity, and acceleration
+references. It adds the model bias and applies the force term
+`-normal * u_f`, with `u_f = f_d + force_kp * (f_d - f_m)`. The measured
+compression `f_m` is the tared x/z force magnitude. The angle estimator
+uses the same bounded compression command as the task wrench. The
+workspace, acceleration, wrench, and torque guards remain active.
 
-Set the trajectory duration, force PI gains, and limits in
-`config/cartesian_iac1_tracking_control.conf`. Numbered CSVs in
-`data/cartesian_iac1_tracking_control/` include trajectory derivatives and
-the scalar commanded compression. The tracking plotter opens the latest
-tracking run by default and also accepts a specific CSV path.
+Set the positive `force_kp`, trajectory duration, and limits in
+`config/cartesian_iac1_tracking_control.conf`. Remove the legacy `force_ki`
+and `force_integral_limit_N` entries from custom tracking configurations.
+Numbered CSVs in `data/cartesian_iac1_tracking_control/` include the x/z
+reference derivatives and commanded compression. The tracking plotter opens
+the latest tracking run by default and also accepts a specific CSV path.
 
 ```bash
 source .venv/bin/activate
 python plot/plot_cartesian_iac1_tracking_control.py
 python plot/plot_cartesian_iac1_tracking_control.py data/cartesian_iac1_tracking_control/001.csv
 ```
+
+Use `scripts/iac1e2_experiment.py prepare` to save separate trial configs.
+Its `trial` command prints the controller invocation and opens the interactive
+controller when passed `--run`. For `summarize`, pass the trial's configured
+`run_duration_s` with `--duration` and the measured tangent angle in degrees
+with `--surface-angle`.
 
 ### IAC1 estimation followed by hybrid control
 

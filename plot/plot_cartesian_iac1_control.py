@@ -21,6 +21,10 @@ IAC1_COLUMNS = (
 
 def plot(plt, path, data, surface_angle=None):
     sequential = "normal_frozen" in data
+    tracking = "normal_command_N" in data and not sequential
+    measured_components = [component for component in ("x", "z")
+                           if f"external_f{component}_N" in data]
+    show_force_panels = tracking and bool(measured_components)
     if sequential:
         fig = plt.figure(figsize=(12, 9), layout="constrained")
         grid = fig.add_gridspec(3, 2)
@@ -33,9 +37,12 @@ def plot(plt, path, data, surface_angle=None):
             axis.tick_params(labelbottom=False)
         variant = "IAC1 estimation then hybrid control"
     else:
-        fig, axes = plt.subplots(3, 2, sharex=True, figsize=(12, 9), layout="constrained")
-        force, angle, x_position, z_position, wrench, torque = axes.flat
-        variant = "IAC1 trajectory and force tracking" if "normal_command_N" in data else "IAC1 adaptive normal"
+        rows = 4 if show_force_panels else 3
+        fig, axes = plt.subplots(rows, 2, sharex=True, figsize=(12, 3 * rows), layout="constrained")
+        force, angle, x_position, z_position, wrench, torque = axes[:3].flat
+        variant = "IAC1 adaptive normal"
+        if tracking:
+            variant = "IAC1E2 tracking controller"
     fig.suptitle(f"{variant} · {path.name}")
     time = data["elapsed_s"]
 
@@ -43,7 +50,7 @@ def plot(plt, path, data, surface_angle=None):
     force_label = ("Measured force (projected after switch)" if "normal_frozen" in data
                    else "Measured x/z force magnitude")
     force.plot(time, data["normal_force_N"], label=force_label)
-    if "normal_command_N" in data and not sequential:
+    if tracking:
         force.plot(time, data["normal_command_N"], ":", label="Commanded force")
     if not sequential and "normal_command_N" not in data:
         for component, style in (("z", "-."), ("x", ":")):
@@ -51,6 +58,15 @@ def plot(plt, path, data, surface_angle=None):
             if key in data:
                 force.plot(time, data[key], style, label=f"Measured base-frame F{component}")
     force.set(title="Contact force", ylabel="N")
+    time_axes = (wrench, torque)
+    if show_force_panels:
+        time_axes = tuple(axes[3, :len(measured_components)])
+        for axis, component in zip(time_axes, measured_components):
+            axis.plot(time, data[f"external_f{component}_N"],
+                      label=f"Measured F{component}")
+            axis.set(title=f"Measured base-frame {component} force", ylabel="N")
+        for axis in axes[3, len(measured_components):]:
+            axis.set_visible(False)
 
     contact_index = next((i for i, value in enumerate(data["contact_confirmed"]) if value), None)
     effective = [degrees(value) for value in data["effective_angle_rad"]]
@@ -114,6 +130,8 @@ def plot(plt, path, data, surface_angle=None):
     contact = time[contact_index] if contact_index is not None else None
     switch = time[switch_index] if switch_index is not None else None
     for axis in fig.axes:
+        if not axis.get_visible():
+            continue
         if contact is not None:
             axis.axvline(contact, color="0.45", linestyle=":",
                          label="Contact confirmed" if axis is force else None)
@@ -122,7 +140,7 @@ def plot(plt, path, data, surface_angle=None):
                          label="Normal frozen" if axis is angle else None)
         axis.legend()
         axis.grid(alpha=0.25)
-    for axis in (wrench, torque):
+    for axis in time_axes:
         axis.set_xlabel("Elapsed time (s)")
     return fig
 
@@ -133,7 +151,7 @@ def main(default_directory=DATA_DIR, description=__doc__):
     parser.set_defaults(tracking=False)
     if default_directory == DATA_DIR:
         parser.add_argument("--tracking", action="store_true",
-                            help="Open the latest tracking-variant run when no CSV is given")
+                            help="Open the latest IAC1E2 tracking run when no CSV is given")
     parser.add_argument("--output", type=Path, help="Save the figure instead of displaying it")
     parser.add_argument("--surface-angle-deg", type=float,
                         help="Known surface angle in degrees from +x toward +z, used for plotting")
